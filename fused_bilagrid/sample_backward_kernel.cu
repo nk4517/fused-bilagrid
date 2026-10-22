@@ -3,22 +3,25 @@
 
 // template<int compute_coords_grad>
 #ifdef COMPUTE_COORDS_GRAD
+template<int C>
 __global__ void bilagrid_sample_backward_kernel_cg(
 #else
+template<int C>
 __global__ void bilagrid_sample_backward_kernel(
 #endif
-    const float* __restrict__ bilagrid,  // [N,12,L,H,W]
+    const float* __restrict__ bilagrid,  // [N,C*(C+1),L,H,W]
     const float* __restrict__ coords,  // [N,m,h,w,2]
-    const float* __restrict__ rgb,  // [N,m,h,w,3]
-    const float* __restrict__ v_output,  // [N,m,h,w,3]
-    float* __restrict__ v_bilagrid,  // [N,12,L,H,W]
+    const float* __restrict__ rgb,  // [N,m,h,w,C]
+    const float* __restrict__ v_output,  // [N,m,h,w,C]
+    float* __restrict__ v_bilagrid,  // [N,C*(C+1),L,H,W]
     #ifdef COMPUTE_COORDS_GRAD
     float* __restrict__ v_coords,  // [N,m,h,w,2]
     #endif
-    float* __restrict__ v_rgb,  // [N,m,h,w,3]
+    float* __restrict__ v_rgb,  // [N,m,h,w,C]
     int N, int L, int H, int W,
     int m, int h, int w
 ) {
+    constexpr int NC = C * (C + 1);
     #if 0
     // faster when coords are random
     int wi = blockIdx.x * blockDim.x + threadIdx.x;
@@ -38,10 +41,14 @@ __global__ void bilagrid_sample_backward_kernel(
 
     // grid coords
     int g_off = (((ni*m + mi)*h + hi)*w + wi);
-    float sr = rgb[3*g_off+0], sg = rgb[3*g_off+1], sb = rgb[3*g_off+2];
+    float s[C];
+    #pragma unroll
+    for (int c = 0; c < C; c++) s[c] = rgb[C*g_off+c];
     float gx = coords[2*g_off+0];
     float gy = coords[2*g_off+1];
-    float gz = kC2G_r * sr + kC2G_g * sg + kC2G_b * sb;
+    float gz = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < C; c++) gz += guidance_weight<C>(c) * s[c];
     float x = gx * (W - 1);
     float y = gy * (H - 1);
     float z = gz * (L - 1);
@@ -65,23 +72,23 @@ __global__ void bilagrid_sample_backward_kernel(
     float f111 = fx*fy*fz;
 
     // read rgb coeffs and upstream gradient
-    float dr = v_output[3*g_off+0];
-    float dg = v_output[3*g_off+1];
-    float db = v_output[3*g_off+2];
-    float vr = 0.0, vg = 0.0, vb = 0.0;
-
-    // accumulate bilagrid gradient over 12 channels
+    float gd[C];
     #pragma unroll
-    for (int ci = 0; ci < 12; ++ci) {
+    for (int c = 0; c < C; c++) gd[c] = v_output[C*g_off+c];
+    float vs[C] = {0.0f};
+
+    // accumulate bilagrid gradient over all channels
+    #pragma unroll
+    for (int ci = 0; ci < NC; ++ci) {
         // weight from rgb channel
-        int si = ci % 4, di = ci / 4;
-        float r_coeff = (si==0 ? sr : si==1 ? sg : si==2 ? sb : 1.f);
-        float gout = (di==0 ? dr : di==1 ? dg : db);
+        int si = ci % (C + 1), di = ci / (C + 1);
+        float r_coeff = (si < C ? s[si] : 1.f);
+        float gout = gd[di];
         float grad_weight = r_coeff * gout;
 
         // scatter back into the eight corners
         // accounts for >90% of run time, needs optimization
-        int base = ((ni*12 + ci)*L*H*W);
+        int base = ((ni*NC + ci)*L*H*W);
         atomicAdd(v_bilagrid + base + (z0*H + y0)*W + x0, f000 * grad_weight);
         atomicAdd(v_bilagrid + base + (z0*H + y0)*W + x1, f001 * grad_weight);
         atomicAdd(v_bilagrid + base + (z0*H + y1)*W + x0, f010 * grad_weight);
@@ -92,14 +99,14 @@ __global__ void bilagrid_sample_backward_kernel(
         atomicAdd(v_bilagrid + base + (z1*H + y1)*W + x1, f111 * grad_weight);
 
         // gradient w.r.t. rgb coefficients
-        if (si < 3) {
+        if (si < C) {
             float val =
                 ( ( (bilagrid[base + (z0*H + y0)*W + x0]*(1-fx) + bilagrid[base + (z0*H + y0)*W + x1]*fx)*(1-fy)
                     + (bilagrid[base + (z0*H + y1)*W + x0]*(1-fx) + bilagrid[base + (z0*H + y1)*W + x1]*fx)*fy )*(1-fz)
                 + ( (bilagrid[base + (z1*H + y0)*W + x0]*(1-fx) + bilagrid[base + (z1*H + y0)*W + x1]*fx)*(1-fy)
                     + (bilagrid[base + (z1*H + y1)*W + x0]*(1-fx) + bilagrid[base + (z1*H + y1)*W + x1]*fx)*fy )*fz
                 );
-            (si == 0 ? vr : si == 1 ? vg : vb) += val * gout;
+            vs[si] += val * gout;
         }
     }
 
@@ -139,12 +146,12 @@ __global__ void bilagrid_sample_backward_kernel(
         float trilerp = 0.f;
         // gather the corresponding bilagrid value for each of the 12 channels
         #pragma unroll
-        for (int ci = 0; ci < 12; ++ci) {
-            const float* vol = bilagrid + ((ni*12 + ci)*L*H*W);
+        for (int ci = 0; ci < NC; ++ci) {
+            const float* vol = bilagrid + ((ni*NC + ci)*L*H*W);
             float v = vol[(zi*H + yi)*W + xi];
-            int si = ci % 4, di = ci / 4;
-            float r_coeff = (si==0 ? sr : si==1 ? sg : si==2 ? sb : 1.f);
-            float gout = (di==0 ? dr : di==1 ? dg : db);
+            int si = ci % (C + 1), di = ci / (C + 1);
+            float r_coeff = (si < C ? s[si] : 1.f);
+            float gout = gd[di];
             trilerp += v * r_coeff * gout;
         }
         #ifdef COMPUTE_COORDS_GRAD
@@ -159,7 +166,7 @@ __global__ void bilagrid_sample_backward_kernel(
     v_coords[2*g_off+1] = gy_grad * (float)(y0 != y && y1 != y);
     #endif
     gz_grad *= (float)(z0 != z && z1 != z);
-    v_rgb[3*g_off+0] = vr + kC2G_r * gz_grad;
-    v_rgb[3*g_off+1] = vg + kC2G_g * gz_grad;;
-    v_rgb[3*g_off+2] = vb + kC2G_b * gz_grad;;
+    #pragma unroll
+    for (int c = 0; c < C; c++)
+        v_rgb[C*g_off+c] = vs[c] + guidance_weight<C>(c) * gz_grad;
 }

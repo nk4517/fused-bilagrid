@@ -6,14 +6,16 @@
 namespace cg = cooperative_groups;
 
 
+template<int C>
 __global__ void bilagrid_uniform_sample_backward_v1_kernel_bilagrid(
-    const float* __restrict__ rgb,  // [N,m,h,w,3]
-    const float* __restrict__ v_output,  // [N,m,h,w,3]
-    float* __restrict__ v_bilagrid,  // [N,12,L,H,W]
+    const float* __restrict__ rgb,  // [N,m,h,w,C]
+    const float* __restrict__ v_output,  // [N,m,h,w,C]
+    float* __restrict__ v_bilagrid,  // [N,C*(C+1),L,H,W]
     int N, int L, int H, int W,
     int m, int h, int w,
     int mult_x, int mult_y
 ) {
+    constexpr int NC = C * (C + 1);
     int x_idx = blockIdx.x * blockDim.x + threadIdx.x;
     int y_idx = blockIdx.y * blockDim.y + threadIdx.y;
     int idx = blockIdx.z * blockDim.z + threadIdx.z;
@@ -45,7 +47,7 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_bilagrid(
     int hi1 = min(block_hi0+(yf+1)*y_step, block_hi1);
 
     // Result for each affine mat channel
-    float accum[12] = {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    float accum[NC] = {0.0f};
 
     // Loop over all samples for this batch
     if (inside)
@@ -53,15 +55,17 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_bilagrid(
         for (int wi = wi0; wi < wi1; wi++)
         for (int hi = hi0; hi < hi1; hi++) {
 
-            int g_off = (((ni*m + mi)*h + hi)*w + wi)*3;
-            float sr = rgb[g_off+0];
-            float sg = rgb[g_off+1];
-            float sb = rgb[g_off+2];
+            int g_off = (((ni*m + mi)*h + hi)*w + wi)*C;
+            float s[C];
+            #pragma unroll
+            for (int c = 0; c < C; c++) s[c] = rgb[g_off+c];
 
             float x = (float)wi / (float)(w-1) * (float)(W-1);
             float y = (float)hi / (float)(h-1) * (float)(H-1);
-            float z = (kC2G_r * sr + kC2G_g * sg + kC2G_b * sb);
-            z = min(max(z, 0.0f), 1.0f) * (float)(L-1);
+            float gz = 0.0f;
+            #pragma unroll
+            for (int c = 0; c < C; c++) gz += guidance_weight<C>(c) * s[c];
+            float z = min(max(gz, 0.0f), 1.0f) * (float)(L-1);
 
             int x0 = floorf(x), y0 = floorf(y), z0 = floorf(z);
             int x1 = min(x0+1, W-1);
@@ -84,17 +88,17 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_bilagrid(
                 if (xi == x1 && yi == y1) accum_t += fx*fy*fz;
             }
 
-            float dr = v_output[g_off+0];
-            float dg = v_output[g_off+1];
-            float db = v_output[g_off+2];
+            float gd[C];
+            #pragma unroll
+            for (int c = 0; c < C; c++) gd[c] = v_output[g_off+c];
 
             #pragma unroll
-            for (int ci = 0; ci < 12; ci++) {
-                int si = ci % 4;
-                int di = ci / 4;
+            for (int ci = 0; ci < NC; ci++) {
+                int si = ci % (C + 1);
+                int di = ci / (C + 1);
 
-                float r_coeff = (si==0 ? sr : si==1 ? sg : si==2 ? sb : 1.f);
-                float gout = (di==0 ? dr : di==1 ? dg : db);
+                float r_coeff = (si < C ? s[si] : 1.f);
+                float gout = gd[di];
                 float grad_weight = r_coeff * gout;
 
                 accum[ci] += accum_t * grad_weight;
@@ -105,13 +109,13 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_bilagrid(
 
     // Write result
 
-    int out_idx_start = ((ni*12*L + zi)*H + yi)*W + xi;
+    int out_idx_start = ((ni*NC*L + zi)*H + yi)*W + xi;
     int out_idx_offset = L*H*W;
 
     // simply write in this case
     if (mult_x*mult_y == 1) {
         #pragma unroll
-        for (int ci = 0; ci < 12; ci++) {
+        for (int ci = 0; ci < NC; ci++) {
             int out_idx = out_idx_start + ci * out_idx_offset;
             if (isfinite(accum[ci]))
                 v_bilagrid[out_idx] = accum[ci];
@@ -122,7 +126,7 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_bilagrid(
     // out_idx can be different for each thread, fall back to global atomicAdd
     if (mult_x % blockDim.x != 0 || mult_y % blockDim.y != 0) {
         #pragma unroll
-        for (int ci = 0; ci < 12; ci++) {
+        for (int ci = 0; ci < NC; ci++) {
             int out_idx = out_idx_start + ci * out_idx_offset;
             if (isfinite(accum[ci]))
                 atomicAdd(v_bilagrid + out_idx, accum[ci]);
@@ -138,7 +142,7 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_bilagrid(
     int tid = (threadIdx.z * blockDim.y + threadIdx.y) * blockDim.x + threadIdx.x;
 
     #pragma unroll
-    for (int ci = 0; ci < 12; ci++) {
+    for (int ci = 0; ci < NC; ci++) {
         int out_idx = out_idx_start + ci * out_idx_offset;
 
         sharedData[tid] = isfinite(accum[ci]) ? accum[ci] : 0.0f;
@@ -157,14 +161,16 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_bilagrid(
 }
 
 
+template<int C>
 __global__ void bilagrid_uniform_sample_backward_v1_kernel_rgb(
-    const float* __restrict__ bilagrid,  // [N,12,L,H,W]
-    const float* __restrict__ rgb,  // [N,m,h,w,3]
-    const float* __restrict__ v_output,  // [N,m,h,w,3]
-    float* __restrict__ v_rgb,  // [N,m,h,w,3]
+    const float* __restrict__ bilagrid,  // [N,C*(C+1),L,H,W]
+    const float* __restrict__ rgb,  // [N,m,h,w,C]
+    const float* __restrict__ v_output,  // [N,m,h,w,C]
+    float* __restrict__ v_rgb,  // [N,m,h,w,C]
     int N, int L, int H, int W,
     int m, int h, int w
 ) {
+    constexpr int NC = C * (C + 1);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = N * m * h * w;
     if (idx >= total) return;
@@ -176,19 +182,22 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_rgb(
     int ni = tmp;
 
     // input and output colors
-    int g_off = (((ni * m + mi) * h + hi) * w + wi) * 3;
-    float sr = rgb[g_off+0];
-    float sg = rgb[g_off+1];
-    float sb = rgb[g_off+2];
-    float dr = v_output[g_off+0];
-    float dg = v_output[g_off+1];
-    float db = v_output[g_off+2]; 
-    float vr = 0.0, vg = 0.0, vb = 0.0;
+    int g_off = (((ni * m + mi) * h + hi) * w + wi) * C;
+    float s[C], gd[C];
+    #pragma unroll
+    for (int c = 0; c < C; c++) {
+        s[c] = rgb[g_off+c];
+        gd[c] = v_output[g_off+c];
+    }
+    float vs[C] = {0.0f};
 
     // grid coords
     float x = (float)wi / (float)(w-1) * (float)(W-1);
     float y = (float)hi / (float)(h-1) * (float)(H-1);
-    float z = (kC2G_r * sr + kC2G_g * sg + kC2G_b * sb) * (L-1);
+    float gz = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < C; c++) gz += guidance_weight<C>(c) * s[c];
+    float z = gz * (L-1);
     int x0 = floorf(x), y0 = floorf(y), z0 = floorf(z);
     int x1 = min(x0+1, W-1);
     int y1 = min(y0+1, H-1);
@@ -208,13 +217,13 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_rgb(
 
     // accumulate bilagrid gradient over 12 channels
     #pragma unroll
-    for (int si = 0; si < 3; si++) {
+    for (int si = 0; si < C; si++) {
         #pragma unroll
-        for (int di = 0; di < 3; di++) {
-            int ci = 4 * di + si;
-            float gout = (di==0 ? dr : di==1 ? dg : db);
+        for (int di = 0; di < C; di++) {
+            int ci = (C + 1) * di + si;
+            float gout = gd[di];
 
-            int base = ((ni*12 + ci)*L*H*W);
+            int base = ((ni*NC + ci)*L*H*W);
             float val =
                 bilagrid[base+(z0*H+y0)*W+x0] * w000 +
                 bilagrid[base+(z0*H+y0)*W+x1] * w001 +
@@ -224,7 +233,7 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_rgb(
                 bilagrid[base+(z1*H+y0)*W+x1] * w101 +
                 bilagrid[base+(z1*H+y1)*W+x0] * w110 +
                 bilagrid[base+(z1*H+y1)*W+x1] * w111;
-            (si == 0 ? vr : si == 1 ? vg : vb) += val * gout;
+            vs[si] += val * gout;
         }
     }
 
@@ -246,22 +255,21 @@ __global__ void bilagrid_uniform_sample_backward_v1_kernel_rgb(
         float trilerp = 0.f;
         // gather the corresponding bilagrid value for each of the 12 channels
         #pragma unroll
-        for (int ci = 0; ci < 12; ++ci) {
-            const float* vol = bilagrid + ((ni*12 + ci)*L*H*W);
+        for (int ci = 0; ci < NC; ++ci) {
+            const float* vol = bilagrid + ((ni*NC + ci)*L*H*W);
             float v = vol[(zi*H + yi)*W + xi];
-            int si = ci % 4, di = ci / 4;
-            float r_coeff = (si==0 ? sr : si==1 ? sg : si==2 ? sb : 1.f);
-            float gout = (di==0 ? dr : di==1 ? dg : db);
+            int si = ci % (C + 1), di = ci / (C + 1);
+            float r_coeff = (si < C ? s[si] : 1.f);
+            float gout = gd[di];
             trilerp += v * r_coeff * gout;
         }
         gz_grad += dwdz[corner] * (L-1) * trilerp;
     }
-    vr += kC2G_r * gz_grad;
-    vg += kC2G_g * gz_grad;
-    vb += kC2G_b * gz_grad;
-    v_rgb[g_off+0] = isfinite(vr) ? vr : 0.0f;
-    v_rgb[g_off+1] = isfinite(vg) ? vg : 0.0f;
-    v_rgb[g_off+2] = isfinite(vb) ? vb : 0.0f;
+    #pragma unroll
+    for (int c = 0; c < C; c++) {
+        float vc = vs[c] + guidance_weight<C>(c) * gz_grad;
+        v_rgb[g_off+c] = isfinite(vc) ? vc : 0.0f;
+    }
 }
 
 
@@ -273,7 +281,7 @@ void bilagrid_uniform_sample_backward_v1(
     float* v_bilagrid,
     float* v_rgb,
     int N, int L, int H, int W,
-    int m, int h, int w,
+    int m, int h, int w, int C,
     const unsigned block_x, const unsigned block_y,
     const int target_tile_size
 ) {
@@ -296,10 +304,16 @@ void bilagrid_uniform_sample_backward_v1(
             (H*mult_y +block.y-1)/block.y,
             (N*L +block.z-1)/block.z
         };
-        bilagrid_uniform_sample_backward_v1_kernel_bilagrid<<<bounds, block>>>(
-            rgb, v_output, v_bilagrid,
-            N, L, H, W, m, h, w, mult_x, mult_y
-        );
+        if (C == 1)
+            bilagrid_uniform_sample_backward_v1_kernel_bilagrid<1><<<bounds, block>>>(
+                rgb, v_output, v_bilagrid,
+                N, L, H, W, m, h, w, mult_x, mult_y
+            );
+        else
+            bilagrid_uniform_sample_backward_v1_kernel_bilagrid<3><<<bounds, block>>>(
+                rgb, v_output, v_bilagrid,
+                N, L, H, W, m, h, w, mult_x, mult_y
+            );
     }
 
     // v_coords and v_rgb
@@ -307,10 +321,17 @@ void bilagrid_uniform_sample_backward_v1(
         int total = N * m * h * w;
         int threads = 256;
         int blocks = (total + threads - 1) / threads;
-        bilagrid_uniform_sample_backward_v1_kernel_rgb<<<blocks, threads>>>(
-            bilagrid, rgb, v_output,
-            v_rgb,
-            N, L, H, W, m, h, w
-        );
+        if (C == 1)
+            bilagrid_uniform_sample_backward_v1_kernel_rgb<1><<<blocks, threads>>>(
+                bilagrid, rgb, v_output,
+                v_rgb,
+                N, L, H, W, m, h, w
+            );
+        else
+            bilagrid_uniform_sample_backward_v1_kernel_rgb<3><<<blocks, threads>>>(
+                bilagrid, rgb, v_output,
+                v_rgb,
+                N, L, H, W, m, h, w
+            );
     }
 }

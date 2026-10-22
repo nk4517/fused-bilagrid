@@ -62,7 +62,7 @@ class _FusedUniformGridSample(torch.autograd.Function):
 class _FusedTotalVariationLoss(torch.autograd.Function):
     @staticmethod
     def forward(ctx, bilagrid):
-        assert bilagrid.ndim == 5 and bilagrid.shape[1] == 12, bilagrid.shape
+        assert bilagrid.ndim == 5 and bilagrid.shape[1] in (2, 12), bilagrid.shape
         assert bilagrid.shape[-3] >= 2 and bilagrid.shape[-2] >= 2 and bilagrid.shape[-1] >= 2, bilagrid.shape
 
         ctx.save_for_backward(bilagrid)
@@ -238,13 +238,14 @@ class BilateralGrid(nn.Module):
     Holds one or more than one bilateral grids.
     """
 
-    def __init__(self, num, grid_X=16, grid_Y=16, grid_W=8):
+    def __init__(self, num, grid_X=16, grid_Y=16, grid_W=8, channels=3):
         """
         Args:
             num (int): The number of bilateral grids (i.e., the number of views).
             grid_X (int): Defines grid width $W$.
             grid_Y (int): Defines grid height $H$.
             grid_W (int): Defines grid guidance dimension $L$.
+            channels (int): Number of color channels (3 for RGB, 1 for Y-only).
         """
         super(BilateralGrid, self).__init__()
 
@@ -254,6 +255,8 @@ class BilateralGrid(nn.Module):
         """Grid height. Type: int."""
         self.grid_guidance = grid_W
         """Grid guidance dimension. Type: int."""
+        self.channels = channels
+        """Number of color channels (3 for RGB, 1 for Y-only). Type: int."""
 
         # Initialize grids.
         grid = self._init_identity_grid()
@@ -261,7 +264,7 @@ class BilateralGrid(nn.Module):
         """ A 5-D tensor of shape $(N, 12, L, H, W)$."""
 
     def _init_identity_grid(self):
-        grid = torch.eye(4)[:3].float()
+        grid = torch.eye(self.channels + 1)[:self.channels].float()
         grid = grid.repeat([self.grid_guidance * self.grid_height * self.grid_width, 1])  # (L * H * W, 12)
         grid = grid.reshape(1, self.grid_guidance, self.grid_height, self.grid_width, -1)  # (1, L, H, W, 12)
         grid = grid.permute(0, 4, 1, 2, 3)  # (1, 12, L, H, W)

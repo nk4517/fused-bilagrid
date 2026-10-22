@@ -1,15 +1,17 @@
 #include "config.h"
 
 
+template<int C>
 __global__ void bilagrid_uniform_sample_backward_v2_kernel(
-    const float* __restrict__ bilagrid,  // [N,12,L,H,W]
-    const float* __restrict__ rgb,  // [N,m,h,w,3]
-    const float* __restrict__ v_output,  // [N,m,h,w,3]
-    float* __restrict__ v_bilagrid,  // [N,12,L,H,W]
-    float* __restrict__ v_rgb,  // [N,m,h,w,3]
+    const float* __restrict__ bilagrid,  // [N,C*(C+1),L,H,W]
+    const float* __restrict__ rgb,  // [N,m,h,w,C]
+    const float* __restrict__ v_output,  // [N,m,h,w,C]
+    float* __restrict__ v_bilagrid,  // [N,C*(C+1),L,H,W]
+    float* __restrict__ v_rgb,  // [N,m,h,w,C]
     int N, int L, int H, int W,
     int m, int h, int w
 ) {
+    constexpr int NC = C * (C + 1);
     #if 0
     int wi = blockIdx.x * blockDim.x + threadIdx.x;
     int hi = blockIdx.y * blockDim.y + threadIdx.y;
@@ -26,16 +28,21 @@ __global__ void bilagrid_uniform_sample_backward_v2_kernel(
     int ni = idx / m;
 
     // load RGB colors
-    int g_off = (((ni*m + mi)*h + hi)*w + wi) * 3;
-    float sr = rgb[g_off+0], sg = rgb[g_off+1], sb = rgb[g_off+2];
-    sr = isfinite(sr) ? sr : 0.5f;
-    sg = isfinite(sg) ? sg : 0.5f;
-    sb = isfinite(sb) ? sb : 0.5f;
+    int g_off = (((ni*m + mi)*h + hi)*w + wi) * C;
+    float s[C];
+    #pragma unroll
+    for (int c = 0; c < C; c++) {
+        float sc = rgb[g_off+c];
+        s[c] = isfinite(sc) ? sc : 0.5f;
+    }
 
     // grid coords
     float x = (float)wi / (float)(w-1) * (float)(W-1);
     float y = (float)hi / (float)(h-1) * (float)(H-1);
-    float z = (kC2G_r * sr + kC2G_g * sg + kC2G_b * sb) * (L-1);
+    float gz = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < C; c++) gz += guidance_weight<C>(c) * s[c];
+    float z = gz * (L-1);
 
     // floor + ceil, clamped
     int x0 = floorf(x), y0 = floorf(y), z0 = floorf(z);
@@ -48,13 +55,13 @@ __global__ void bilagrid_uniform_sample_backward_v2_kernel(
     float fx = x - x0, fy = y - y0, fz = z - z0;
 
     // read rgb coeffs and upstream gradient
-    float dr = v_output[g_off+0];
-    float dg = v_output[g_off+1];
-    float db = v_output[g_off+2];
-    dr = isfinite(dr) ? dr : 0.0f;
-    dg = isfinite(dg) ? dg : 0.0f;
-    db = isfinite(db) ? db : 0.0f;
-    float vr = 0.0, vg = 0.0, vb = 0.0;
+    float gd[C];
+    #pragma unroll
+    for (int c = 0; c < C; c++) {
+        float dc = v_output[g_off+c];
+        gd[c] = isfinite(dc) ? dc : 0.0f;
+    }
+    float vs[C] = {0.0f};
 
     // spatial derivatives for coords
 
@@ -72,17 +79,17 @@ __global__ void bilagrid_uniform_sample_backward_v2_kernel(
 
         float trilerp = 0.f;
         #pragma unroll
-        for (int ci = 0; ci < 12; ++ci) {
-            int bidx = (((ni*12 + ci)*L + zi)*H + yi)*W + xi;
-            int si = ci % 4, di = ci / 4;
+        for (int ci = 0; ci < NC; ++ci) {
+            int bidx = (((ni*NC + ci)*L + zi)*H + yi)*W + xi;
+            int si = ci % (C + 1), di = ci / (C + 1);
 
-            float r_coeff = (si==0 ? sr : si==1 ? sg : si==2 ? sb : 1.f);
-            float gout = (di==0 ? dr : di==1 ? dg : db);
+            float r_coeff = (si < C ? s[si] : 1.f);
+            float gout = gd[di];
 
             float v = bilagrid[bidx];
 
-            if (si < 3)
-                (si == 0 ? vr : si == 1 ? vg : vb) += v * f * gout;
+            if (si < C)
+                vs[si] += v * f * gout;
 
             float grad_weight = r_coeff * gout;
             trilerp += v * grad_weight;
@@ -93,9 +100,9 @@ __global__ void bilagrid_uniform_sample_backward_v2_kernel(
 
     // save gradient, with discontinuity masking
     gz_grad *= (float)(z0 != z && z1 != z);
-    v_rgb[g_off+0] = vr + kC2G_r * gz_grad;
-    v_rgb[g_off+1] = vg + kC2G_g * gz_grad;
-    v_rgb[g_off+2] = vb + kC2G_b * gz_grad;
+    #pragma unroll
+    for (int c = 0; c < C; c++)
+        v_rgb[g_off+c] = vs[c] + guidance_weight<C>(c) * gz_grad;
 }
 
 
@@ -106,7 +113,7 @@ void bilagrid_uniform_sample_backward_v2(
     float* v_bilagrid,
     float* v_rgb,
     int N, int L, int H, int W,
-    int m, int h, int w
+    int m, int h, int w, int C
 ) {
     dim3 block = { 16, 16, 1 };
     dim3 bounds = {
@@ -114,9 +121,16 @@ void bilagrid_uniform_sample_backward_v2(
         (h +block.y-1)/block.y,
         (N*m +block.z-1)/block.z
     };
-    bilagrid_uniform_sample_backward_v2_kernel<<<bounds, block>>>(
-        bilagrid, rgb, v_output,
-        v_bilagrid, v_rgb,
-        N, L, H, W, m, h, w
-    );
+    if (C == 1)
+        bilagrid_uniform_sample_backward_v2_kernel<1><<<bounds, block>>>(
+            bilagrid, rgb, v_output,
+            v_bilagrid, v_rgb,
+            N, L, H, W, m, h, w
+        );
+    else
+        bilagrid_uniform_sample_backward_v2_kernel<3><<<bounds, block>>>(
+            bilagrid, rgb, v_output,
+            v_bilagrid, v_rgb,
+            N, L, H, W, m, h, w
+        );
 }

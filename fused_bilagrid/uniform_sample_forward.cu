@@ -1,13 +1,15 @@
 #include "config.h"
 
 
+template<int C>
 __global__ void bilagrid_uniform_sample_forward_kernel(
-    const float* __restrict__ bilagrid, // [N,12,L,H,W]
-    const float* __restrict__ rgb,  // [N,m,h,w,3]
-    float* __restrict__ output,  // [N,m,h,w,3]
+    const float* __restrict__ bilagrid, // [N,C*(C+1),L,H,W]
+    const float* __restrict__ rgb,  // [N,m,h,w,C]
+    float* __restrict__ output,  // [N,m,h,w,C]
     int N, int L, int H, int W,
     int m, int h, int w
 ) {
+    constexpr int NC = C * (C + 1);
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     int total = N * m * h * w;
     if (idx >= total) return;
@@ -19,18 +21,20 @@ __global__ void bilagrid_uniform_sample_forward_kernel(
     int ni = tmp;
 
     // read coords
-    int g_offset = (((ni * m + mi) * h + hi) * w + wi) * 3;
+    int g_offset = (((ni * m + mi) * h + hi) * w + wi) * C;
 
     // input and output colors
-    float sr = rgb[g_offset+0];
-    float sg = rgb[g_offset+1];
-    float sb = rgb[g_offset+2];
-    float dr = 0.0, dg = 0.0, db = 0.0;
+    float s[C];
+    #pragma unroll
+    for (int c = 0; c < C; c++) s[c] = rgb[g_offset+c];
+    float d[C] = {0.0f};
 
     // grid coords
     float gx = (float)wi / (float)(w-1);
     float gy = (float)hi / (float)(h-1);
-    float gz = kC2G_r * sr + kC2G_g * sg + kC2G_b * sb;
+    float gz = 0.0f;
+    #pragma unroll
+    for (int c = 0; c < C; c++) gz += guidance_weight<C>(c) * s[c];
     float x = gx * (W - 1);
     float y = gy * (H - 1);
     float z = gz * (L - 1);
@@ -52,9 +56,9 @@ __global__ void bilagrid_uniform_sample_forward_kernel(
 
     // interpolate and and affine in one loop
     #pragma unroll
-    for (int ci = 0; ci < 12; ci++) {
+    for (int ci = 0; ci < NC; ci++) {
         // base pointer for this volume
-        int base = (ni*12 + ci)*L*H*W;
+        int base = (ni*NC + ci)*L*H*W;
 
         // fetch 8 corners
         auto v000 = bilagrid[base+(z0*H+y0)*W+x0];
@@ -76,15 +80,14 @@ __global__ void bilagrid_uniform_sample_forward_kernel(
         float val = c0*(1.0f-fz) + c1*fz;
 
         // affine transform
-        int si = ci % 4;
-        int di = ci / 4;
-        (di == 0 ? dr : di == 1 ? dg : db) += val * 
-            (si==0 ? sr : si==1 ? sg : si==2 ? sb : 1.0f);
+        int si = ci % (C + 1);
+        int di = ci / (C + 1);
+        d[di] += val * (si < C ? s[si] : 1.0f);
     }
 
-    output[g_offset+0] = isfinite(dr) ? dr : 0.5f;
-    output[g_offset+1] = isfinite(dg) ? dg : 0.5f;
-    output[g_offset+2] = isfinite(db) ? db : 0.5f;
+    #pragma unroll
+    for (int c = 0; c < C; c++)
+        output[g_offset+c] = isfinite(d[c]) ? d[c] : 0.5f;
 }
 
 
@@ -93,14 +96,20 @@ void bilagrid_uniform_sample_forward(
     const float* rgb,
     float* output,
     int N, int L, int H, int W,
-    int m, int h, int w
+    int m, int h, int w, int C
 ) {
     int total = N * m * h * w;
     int threads = 256;
     int blocks = (total + threads - 1) / threads;
-    bilagrid_uniform_sample_forward_kernel<<<blocks, threads>>>(
-        bilagrid, rgb, output,
-        N, L, H, W, m, h, w
-    );
+    if (C == 1)
+        bilagrid_uniform_sample_forward_kernel<1><<<blocks, threads>>>(
+            bilagrid, rgb, output,
+            N, L, H, W, m, h, w
+        );
+    else
+        bilagrid_uniform_sample_forward_kernel<3><<<blocks, threads>>>(
+            bilagrid, rgb, output,
+            N, L, H, W, m, h, w
+        );
     // cudaDeviceSynchronize();
 }
